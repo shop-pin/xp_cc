@@ -4,24 +4,27 @@ import { execSync, execFileSync } from "child_process";
 import { glob } from "glob";
 import { dirname, join, basename, extname, resolve } from "path";
 import { homedir } from "os";
-
-const isWin = process.platform === "win32";
 import { getMemoryDir } from "./memory.js";
 
+const isWin = process.platform === "win32";
+export type PermissionMode = "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk" | "auto";
+const READ_TOOLS = new Set(["read_file", "list_file", "grep_search", "web_fetch"]);
+const EDIT_TOOLS = new Set(["write_file", "edit_file"]);
+export const CONCURRENCY_SAFE_TOOLS = new Set(["read_file", "list_file", "grep_search", "web_fetch"]);
 export type ToolDef = Anthropic.Tool & { deferred?: boolean };
 
 export const toolDefinitions: ToolDef[] = [
     {
         name: "read_file",
-        description: "Read the contents of a file. Returns the file content with line numbers.",
+        description:
+            "Read the contents of a file. Returns the file content with line numbers.",
         input_schema: {
             type: "object" as const,
             properties: {
-                file_path:
-                {
+                file_path: {
                     type: "string",
                     description: "The path to the file to read"
-                }
+                },
             },
             required: ["file_path"],
         },
@@ -132,7 +135,161 @@ export const toolDefinitions: ToolDef[] = [
             required: ["command"],
         },
     },
+    {
+        name: "skill",
+        description:
+            "Invoke a registered skill by name. Skills are prompt templates loaded from .claude/skills/. Returns the skill's resolved prompt to follow.",
+        input_schema: {
+            type: "object" as const,
+            properties: {
+                skill_name: {
+                    type: "string",
+                    description: "The name of the skill to invoke",
+                },
+                args: {
+                    type: "string",
+                    description: "Optional arguments to pass to the skill",
+                },
+            },
+            required: ["skill_name"],
+        },
+    },
+    {
+        name: "web_fetch",
+        description:
+            "Fetch a URL and return its content as text. For HTML pages, tags are stripped to return readable text. For JSON/text responses, content is returned directly.",
+        input_schema: {
+            type: "object" as const,
+            properties: {
+                url: { type: "string", description: "The URL to fetch" },
+                max_length: {
+                    type: "number",
+                    description: "Maximum content length in characters (default 50000)",
+                },
+            },
+            required: ["url"],
+        },
+    },
+    {
+        name: "enter_plan_mode",
+        description:
+            "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file. Use this when you need to explore the codebase and design an implementation plan before making changes.",
+        input_schema: {
+            type: "object" as const,
+            properties: {},
+        },
+        deferred: true,
+    },
+    {
+        name: "exit_plan_mode",
+        description:
+            "Exit plan mode after you have finished writing your plan to the plan file. The user will review and approve the plan before you proceed with implementation.",
+        input_schema: {
+            type: "object" as const,
+            properties: {},
+        },
+        deferred: true,
+    },
+    {
+        name: "agent",
+        description:
+            "Launch a sub-agent to handle a task autonomously. Sub-agents have isolated context and return their result. Types: 'explore' (read-only, fast search), 'plan' (read-only, structured planning), 'general' (full tools).",
+        input_schema: {
+            type: "object" as const,
+            properties: {
+                description: {
+                    type: "string",
+                    description: "Short (3-5 word) description of the sub-agent's task",
+                },
+                prompt: {
+                    type: "string",
+                    description: "Detailed task instructions for the sub-agent",
+                },
+                type: {
+                    type: "string",
+                    enum: ["explore", "plan", "general"],
+                    description: "Agent type: explore (read-only), plan (planning), general (full tools). Default: general",
+                },
+            },
+            required: ["description", "prompt"],
+        },
+    },
+    {
+        name: "tool_search",
+        description:
+            "Search for available tools by name or keyword. Returns full schema definitions for matching deferred tools so you can use them.",
+        input_schema: {
+            type: "object" as const,
+            properties: {
+                query: {
+                    type: "string",
+                    description: "Tool name or search keywords"
+                },
+            },
+            required: ["query"],
+        },
+    },
 ]
+
+function readFile(input: { file_path: string }): string {
+    try {
+        const content = readFileSync(input.file_path, "utf-8");
+        const lines = content.split("\n");
+        const numbered = lines
+            .map((line, i) => `${String(i + 1).padStart(4)} | ${line}`)
+            .join("\n");
+        return numbered;
+    } catch (e: any) {
+        return `Error reading file: ${e.message}`;
+    }
+}
+
+function autoUpdateMemoryIndex(filePath: string): void {
+  try {
+    const memDir = getMemoryDir();
+    if (filePath.startsWith(memDir) && filePath.endsWith(".md") && !filePath.endsWith("MEMORY.md")) {
+      // Rebuild the index from all memory files. NOTE: must use the ESM
+      // import from the top of this file — `require()` does not exist at
+      // runtime in ESM, and the throw was silently swallowed by the outer
+      // catch, so the index was never rebuilt.
+      const files = readdirSync(memDir).filter(
+        (f: string) => f.endsWith(".md") && f !== "MEMORY.md"
+      );
+      const lines = ["# Memory Index", ""];
+      for (const file of files) {
+        try {
+          const raw = readFileSync(join(memDir, file), "utf-8");
+          const nameMatch = raw.match(/^name:\s*(.+)$/m);
+          const typeMatch = raw.match(/^type:\s*(.+)$/m);
+          const descMatch = raw.match(/^description:\s*(.+)$/m);
+          if (nameMatch && typeMatch) {
+            lines.push(`- **[${nameMatch[1].trim()}](${file})** (${typeMatch[1].trim()}) — ${descMatch?.[1]?.trim() || ""}`);
+          }
+        } catch { /* skip */ }
+      }
+      writeFileSync(join(memDir, "MEMORY.md"), lines.join("\n"));
+    }
+  } catch { /* non-critical */ }
+}
+
+function writeFile(input: { file_path: string; content: string }): string {
+    try {
+        const dir = dirname(input.file_path);
+        if (!existsSync(dir)) {
+            mkdirSync(dir, { recursive: true });
+        }
+        writeFileSync(input.file_path, input.content);
+        autoUpdateMemoryIndex(input.file_path);
+        const lines = input.content.split("\n");
+        const lineCount = lines.length;
+        const preview = lines.slice(0, 30).map((line, i) =>
+            `${String(i + 1).padStart(4)} | ${line}`).join("\n");
+        const truncNote = lineCount > 30 ? `\n ... (${lineCount} lines total)` : "";
+        return `Successfully wrote to ${input.file_path} (${lineCount} lines)\n\n${preview}${truncNote}`;
+    } catch (e: any) {
+        return `Error writing file: ${e.message}`;
+    }
+}
 
 export async function executeTool(
     name: string,
@@ -163,35 +320,6 @@ export async function executeTool(
             return `Unknown tool: ${name}`;
     }
     return result;
-}
-
-function readFile(input: { file_path: string }): string {
-    try {
-        const lines = readFileSync(input.file_path, "utf-8").split("\n");
-        return lines.map((l, i) => `${String(i + 1).padStart(4)} | ${l}`).join("\n");
-    } catch (e: any) {
-        return `Error reading file: ${e.message}`;
-    }
-}
-
-function writeFile(input: { file_path: string; content: string }): string {
-    try {
-        const dir = dirname(input.file_path);
-        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-        writeFileSync(input.file_path, input.content);
-        // Auto-update memory index when writing to memory directory
-        autoUpdateMemoryIndex(input.file_path);
-        // Return content preview for UI display
-        const lines = input.content.split("\n");
-        const lineCount = lines.length;
-        const preview = lines.slice(0, 30).map((l, i) =>
-            `${String(i + 1).padStart(4)} | ${l}`
-        ).join("\n");
-        const truncNote = lineCount > 30 ? `\n  ... (${lineCount} lines total)` : "";
-        return `Successfully wrote to ${input.file_path} (${lineCount} lines)\n\n${preview}${truncNote}`;
-    } catch (e: any) {
-        return `Error writing file: ${e.message}`;
-    }
 }
 
 function editFile(input: {
@@ -297,34 +425,6 @@ function runShell(input: { command: string; timeout?: number }): string {
         }
         return `Command failed (exit code ${e.status})${stdout}${stderr}`;
     }
-}
-
-function autoUpdateMemoryIndex(filePath: string): void {
-    try {
-        const memDir = getMemoryDir();
-        if (filePath.startsWith(memDir) && filePath.endsWith(".md") && !filePath.endsWith("MEMORY.md")) {
-            // Rebuild the index from all memory files. NOTE: must use the ESM
-            // import from the top of this file — `require()` does not exist at
-            // runtime in ESM, and the throw was silently swallowed by the outer
-            // catch, so the index was never rebuilt.
-            const files = readdirSync(memDir).filter(
-                (f: string) => f.endsWith(".md") && f !== "MEMORY.md"
-            );
-            const lines = ["# Memory Index", ""];
-            for (const file of files) {
-                try {
-                    const raw = readFileSync(join(memDir, file), "utf-8");
-                    const nameMatch = raw.match(/^name:\s*(.+)$/m);
-                    const typeMatch = raw.match(/^type:\s*(.+)$/m);
-                    const descMatch = raw.match(/^description:\s*(.+)$/m);
-                    if (nameMatch && typeMatch) {
-                        lines.push(`- **[${nameMatch[1].trim()}](${file})** (${typeMatch[1].trim()}) — ${descMatch?.[1]?.trim() || ""}`);
-                    }
-                } catch { /* skip */ }
-            }
-            writeFileSync(join(memDir, "MEMORY.md"), lines.join("\n"));
-        }
-    } catch { /* non-critical */ }
 }
 
 function normalizeQuotes(s: string): string {
